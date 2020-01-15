@@ -8,6 +8,21 @@ import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 
+import com.nxp.nfclib.classic.MFClassic;
+import com.nxp.nfclib.exceptions.SmartCardException;
+import com.nxp.nfclib.icode.*;
+import com.nxp.nfclib.ntag.*;
+import com.nxp.nfclib.plus.PlusSL1;
+import com.nxp.nfclib.ultralight.Ultralight;
+import com.nxp.nfclib.ultralight.UltralightC;
+import com.nxp.nfclib.ultralight.UltralightEV1;
+import com.nxp.nfclib.utils.NxpLogUtils;
+import com.nxp.nfclib.utils.Utilities;
+import com.nxp.nfcliblite.Interface.NxpNfcLibLite;
+import com.nxp.nfcliblite.Interface.Nxpnfcliblitecallback;
+import com.nxp.nfcliblite.cards.DESFire;
+import com.nxp.nfcliblite.cards.Plus;
+
 // using wildcard imports so we can support Cordova 3.x
 import org.apache.cordova.*; // Cordova 3.x
 
@@ -43,6 +58,7 @@ public class NfcPlugin extends CordovaPlugin implements NfcAdapter.OnNdefPushCom
     private static final String REGISTER_NDEF_FORMATABLE = "registerNdefFormatable";
     private static final String REGISTER_DEFAULT_TAG = "registerTag";
     private static final String REMOVE_DEFAULT_TAG = "removeTag";
+    private static final String WRITE_TAG_WITH_PASSWORD = "writeTagWithPassword";
     private static final String WRITE_TAG = "writeTag";
     private static final String MAKE_READ_ONLY = "makeReadOnly";
     private static final String ERASE_TAG = "eraseTag";
@@ -89,9 +105,9 @@ public class NfcPlugin extends CordovaPlugin implements NfcAdapter.OnNdefPushCom
     private CallbackContext channelCallback;
     private CallbackContext shareTagCallback;
     private CallbackContext handoverCallback;
-
+    private static boolean isNtag21x=false;
     @Override
-    public boolean execute(String action, JSONArray data, CallbackContext callbackContext) throws JSONException {
+    public boolean execute(String action, JSONArray data, CallbackContext callbackContext, String password) throws JSONException {
 
         Log.d(TAG, "execute " + action);
 
@@ -148,6 +164,9 @@ public class NfcPlugin extends CordovaPlugin implements NfcAdapter.OnNdefPushCom
 
         } else if (action.equalsIgnoreCase(WRITE_TAG)) {
             writeTag(data, callbackContext);
+
+        } else if (action.equalsIgnoreCase(WRITE_TAG_WITH_PASSWORD)) {
+            writeTagWithPassword(data, callbackContext, password);
 
         } else if (action.equalsIgnoreCase(MAKE_READ_ONLY)) {
             makeReadOnly(callbackContext);
@@ -290,7 +309,6 @@ public class NfcPlugin extends CordovaPlugin implements NfcAdapter.OnNdefPushCom
 
     private void init(CallbackContext callbackContext) {
         Log.d(TAG, "Enabling plugin " + getIntent());
-
         startNfc();
         if (!recycledIntent()) {
             parseMessage();
@@ -336,7 +354,60 @@ public class NfcPlugin extends CordovaPlugin implements NfcAdapter.OnNdefPushCom
         writeNdefMessage(new NdefMessage(records), tag, callbackContext);
     }
 
+    private void writeTagWithPassword(JSONArray data, CallbackContext callbackContext, String password) throws JSONException {
+        if (getIntent() == null) {  // TODO remove this and handle LostTag
+            callbackContext.error("Failed to write tag, received null intent");
+        }
+
+        Tag tag = savedIntent.getParcelableExtra(NfcAdapter.EXTRA_TAG);
+        NdefRecord[] records = Util.jsonToNdefRecords(data.getString(0));
+        writeNdefMessageWithPassword(new NdefMessage(records), tag, callbackContext);
+    }
+
     private void writeNdefMessage(final NdefMessage message, final Tag tag, final CallbackContext callbackContext) {
+        cordova.getThreadPool().execute(() -> {
+            try {
+                Ndef ndef = Ndef.get(tag);
+            
+
+                if (ndef != null) {
+                    ndef.connect();
+
+                    if (ndef.isWritable()) {
+                        int size = message.toByteArray().length;
+                        if (ndef.getMaxSize() < size) {
+                            callbackContext.error("Tag capacity is " + ndef.getMaxSize() +
+                                    " bytes, message is " + size + " bytes.");
+                        } else {
+                            ndef.writeNdefMessage(message);
+                            callbackContext.success();
+                        }
+                    } else {
+                        callbackContext.error("Tag is read only");
+                    }
+                    ndef.close();
+                } else {
+                    NdefFormatable formatable = NdefFormatable.get(tag);
+                    if (formatable != null) {
+                        formatable.connect();
+                        formatable.format(message);
+                        callbackContext.success();
+                        formatable.close();
+                    } else {
+                        callbackContext.error("Tag doesn't support NDEF");
+                    }
+                }
+            } catch (FormatException e) {
+                callbackContext.error(e.getMessage());
+            } catch (TagLostException e) {
+                callbackContext.error(e.getMessage());
+            } catch (IOException e) {
+                callbackContext.error(e.getMessage());
+            }
+        });
+    }
+
+    private void writeNdefMessageWithPassword(final NdefMessage message, final Tag tag, final CallbackContext callbackContext, String password) {
         cordova.getThreadPool().execute(() -> {
             try {
                 Ndef ndef = Ndef.get(tag);
@@ -349,8 +420,53 @@ public class NfcPlugin extends CordovaPlugin implements NfcAdapter.OnNdefPushCom
                             callbackContext.error("Tag capacity is " + ndef.getMaxSize() +
                                     " bytes, message is " + size + " bytes.");
                         } else {
-                            ndef.writeNdefMessage(message);
-                            callbackContext.success();
+                            if (password != null && !password.equals("")) {
+                                callbackContext.error("Error de contraseña");
+                            }
+                            final byte[] pwd=NfcDecoder.hexToBytes(password);
+                            if (pwd.length!=4){
+                                callbackContext.error("Error de contraseña");
+                            }
+                            isNtag21x=false;
+                            NxpNfcLibLite nxpNfcLib = NxpNfcLibLite.getInstance().registerActivity(cordova.getActivity());
+                            nxpNfcLib.filterIntent(intent, new Inxpnfcliblitecallback() {
+                                @Override
+                                public void onNTag210CardDetected(nTag210 tag) {
+                                    isNtag21x=true;
+                                    if (tag instanceof nTag210){
+                                        try {
+                                            tag.connect();
+                                            tag.programPWDPack(pwd,PACK_PWD);
+                                            tag.enablePasswordProtection(false,tag.getFirstUserpage());
+                                        } catch (SmartCardException e) {
+                                            throw e;
+                                        } catch (IOException e) {
+                                            throw e;
+                                        }
+                                        try {
+                                            tag.authenticatePwd(pwd,PACK_PWD);
+                                            tag.writeNDEF(ndefMessage);
+                                            nfcWriteCallBackListener.success(NfcDecoder.toHexString(tag.getUID()));
+                                            callbackContext.success();
+                                        } catch (SmartCardException e) {
+                                            throw e;
+                                        } catch (IOException e) {
+                                            throw e;
+                                        } finally {
+                                            try {
+                                                tag.close();
+                                            } catch (IOException e) {
+                                                e.printStackTrace();
+                                            }
+                                        }
+                                    } else{
+                                        //error
+                                    }
+                                }
+                            });
+                            if (!isNtag21x){
+                                callbackContext.error("El tag no es tag21x");
+                            }
                         }
                     } else {
                         callbackContext.error("Tag is read only");
